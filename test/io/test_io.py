@@ -37,7 +37,6 @@ async def send_bytes(dut, values):
 
 
 @cocotb.test()
-
 async def test_render(dut):
     """render test, sends render command to parser, waits for render pulse, and checks w / h values"""
     dut._log.info("start render test")
@@ -84,6 +83,59 @@ async def test_render(dut):
     assert seen["h"] == dim, f"render height mismatch: expected {dim:#05x}, got {seen['h']:#05x}"
 
     dut._log.info(f"render test passed: width=height={dim:#05x}")
+
+@cocotb.test()
+# basically same layout as render test, but for sram write command instead of render command
+async def test_object(dut):
+    """object test, sends 1 sram write command to parser with the right addr and data"""
+    dut._log.info("start object test")
+
+    # setup (clock + reset)
+    clock = Clock(dut.clk, 40, units="ns")          # starts clock (25MHz)
+    cocotb.start_soon(clock.start())
+
+    dut.rst_n.value = 0
+    dut.uart_rx.value = 1                           # we're not even using this, so keep idle at 1
+    dut.clkdiv_ctl.value = 0                        # clkdiv not even used, so keep floating at 0
+    dut.clkdiv_data.value = 0
+    dut.dut_io.rx_bytes.valid.value = 0
+    dut.dut_io.rx_bytes.data.value = 0
+    await ClockCycles(dut.clk, 5)                   # hold reset low for 5 cycles
+    dut.rst_n.value = 1                             # release reset
+    await ClockCycles(dut.clk, 2)                   # wait 2 cycles for things to settle, then parser live
+
+    data = 0xABCD                                   # arbitrary test value (16 bits)
+    addr = 0x123                                    # arbitrary test value (9 bits)
+    data_low = data & 0xFF                          # grabs lower 8 bits -> 0xCD
+    data_high = (data >> 8) & 0xFF                  # shifts down, masks lower 8 bits -> 0xAB
+    addr_low = addr & 0xFF                          # grabs lower 8 bits -> 0x23
+    addr_high = (addr >> 8) & 0xFF                  # shifts down, masks lower 8 bits
+
+    # catches the sram write (bgd monitoring)
+    seen = {"wrote": False, "addr": None, "data": None, "wen": None}
+
+    async def monitor_sram():
+        while True:                                # infinite loop that checks if sram_req_valid is high on every clk edge
+            await RisingEdge(dut.clk)
+
+            if int(dut.sram_req_valid.value) == 1 and not seen["wrote"]:
+                seen["wrote"] = True
+                seen["addr"] = int(dut.sram_req_waddr.value)                     # captures addr value at moment of write
+                seen["data"] = int(dut.sram_req_wdata.value)                     # captures data value at moment of write
+                seen["wen"] = int(dut.sram_req_wen.value)                        # captures wen (write enable) value at moment of write
+
+    cocotb.start_soon(monitor_sram())
+
+    await send_bytes(dut, [0x01, data_low, data_high, addr_low, addr_high])     # inject sram write msg, 4 payload bytes (SRAM_WRITE, data low / high, addr low / high)
+    await ClockCycles(dut.clk, 5)                                               # wait a few cycles for things to settle
+
+    # the check
+    assert seen["wrote"] == True, "sram write not seen after object message"
+    assert seen["addr"] == addr, f"waddr mismatch: expected {addr:#05x}, got {seen['addr']:#05x}"
+    assert seen["data"] == data, f"wdata mismatch: expected {data:#06x}, got {seen['data']:#06x}"
+    assert seen["wen"] == 1, f"wen mismatch: expected 1 (write), got {seen['wen']}"
+
+    dut._log.info(f"object test passed: addr={addr:#05x}, data={data:#06x}, wen={seen['wen']}")
 
 
 # async def test(dut):
