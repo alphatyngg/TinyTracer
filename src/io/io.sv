@@ -119,12 +119,11 @@ module io (
     logic rx_escape; //used for the escape character, 03
     logic [1:0] rx_index; //seeing how many bytes received in current message, used to know when to switch states
 
-    // One byte register between the UART and parser. It holds a received byte
-    // until the parser can consume it. rx_seen prevents the same UART valid
-    // level from being captured again on multiple faster clk edges.
+    // One byte register between the UART and parser. The UART and parser now
+    // both use clk, so this register captures each valid/ready handshake once
+    // and holds the byte until the parser can consume it.
     logic [7:0] rx_byte_reg;
     logic       rx_byte_valid;
-    logic       rx_seen;
     logic       rx_capture;
     logic       rx_pop;
 
@@ -136,25 +135,19 @@ module io (
     // it holds a byte. The parser removes the byte only when it can proceed;
     // if SRAM is holding a request and not ready, the parser waits.
     assign rx_bytes.ready = !rx_byte_valid;
-    assign rx_capture = rx_bytes.valid && rx_bytes.ready && !rx_seen;
+    assign rx_capture = rx_bytes.valid && rx_bytes.ready;
     assign rx_pop = rx_byte_valid && (!sram_pending || sram.req_ready);
 
-    // UART valid is generated on clkq, while this parser uses clk. Its valid
-    // level can therefore span multiple clk edges. Capture it once, hold the
-    // byte here, and wait for valid to drop before capturing another one.
+    // UART and parser now share clk. The UART clears valid on the same clock
+    // edge where this register accepts the byte, so rx_seen is not needed.
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rx_byte_reg   <= 8'h00;
             rx_byte_valid <= 1'b0;
-            rx_seen       <= 1'b0;
         end else begin
-            if (!rx_bytes.valid)
-                rx_seen <= 1'b0;
-
             if (rx_capture) begin
                 rx_byte_reg   <= rx_bytes.data;
                 rx_byte_valid <= 1'b1;
-                rx_seen <= 1'b1;
             end else if (rx_pop) begin
                 rx_byte_valid <= 1'b0;
             end
