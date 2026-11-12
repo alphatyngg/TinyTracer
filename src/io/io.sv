@@ -118,21 +118,40 @@ module io (
     parser_state_t rx_state;
     logic rx_escape; //used for the escape character, 03
     logic [1:0] rx_index; //seeing how many bytes received in current message, used to know when to switch states
-    logic [7:0] dim_low; //used to store low bype of dimension, which is 12, so needs 2 bytes
-    logic [7:0] object_data_low; //low byte of data, which is 16, so 2 bytes
-    logic [7:0] object_addr_low; //low byte of address, which is 9, so 2 bytes
-    //these are all registers used to remember the information the parser has recieved so far, and will just send to the appropriate render or sram interface when the message completes
 
-    logic sram_pending; //shows that message is being sent to sram and is waiting for sram to receive so that the parser can continue to recieve more messages, because sram is not a stream interface, so the parser has to wait for the sram to finish before it can recieve more messages, and so this tells the parser to wait until the sram is done before it can continue to recieve more messages
-    logic [ADDR_W-1:0] sram_addr_reg; //register to hold the address of the sram message being sent, so that the parser can continue to recieve more messages while the sram is processing the current message
-    logic [DATA_W-1:0] sram_data_reg; //holds data for the same reason above
-    
-    wire rx_fire = rx_bytes.valid && rx_bytes.ready; //wire just declared to show when a byte has been recieved, so that the parser can know when to process the byte and update its state accordingly
+    // One byte register between the UART and parser. The UART and parser now
+    // both use clk, so this register captures each valid/ready handshake once
+    // and holds the byte until the parser can consume it.
+    logic [7:0] rx_byte_reg;
+    logic       rx_byte_valid;
+    logic       rx_capture;
+    logic       rx_pop;
 
-    //accept another input byte unless the sram write buffer is full
-    always_comb begin
-       rx_bytes.ready = !sram_pending || sram.req_ready; //if sram is not pending or is ready to accept new req, then it will accept new bytes, otherwise it will not
+    logic sram_pending; //holds req_valid high until SRAM accepts this request
+    logic [ADDR_W-1:0] sram_addr_reg; //holds the request address steady until req_valid && req_ready
+    logic [DATA_W-1:0] sram_data_reg; //holds the request data steady until req_valid && req_ready
 
+    // The register is empty when rx_byte_valid is low. READY goes low while
+    // it holds a byte. The parser removes the byte only when it can proceed;
+    // if SRAM is holding a request and not ready, the parser waits.
+    assign rx_bytes.ready = !rx_byte_valid;
+    assign rx_capture = rx_bytes.valid && rx_bytes.ready;
+    assign rx_pop = rx_byte_valid && (!sram_pending || sram.req_ready);
+
+    // UART and parser now share clk. The UART clears valid on the same clock
+    // edge where this register accepts the byte, so rx_seen is not needed.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_byte_reg   <= 8'h00;
+            rx_byte_valid <= 1'b0;
+        end else begin
+            if (rx_capture) begin
+                rx_byte_reg   <= rx_bytes.data;
+                rx_byte_valid <= 1'b1;
+            end else if (rx_pop) begin
+                rx_byte_valid <= 1'b0;
+            end
+        end
     end
 
     assign sram.req_valid = sram_pending; // purpose is that if sram_pending is 1, then sram.req_valid will be 1, which means that the sram interface will know that there is a request pending and it should process it, and if sram_pending is 0, then sram.req_valid will be 0, which means that the sram interface will know that there is no request pending and it should not process anything
@@ -145,10 +164,6 @@ module io (
             rx_state        <= RX_IDLE;
             rx_escape       <= 1'b0;
             rx_index        <= 2'd0;
-            dim_low         <= 8'h00;
-            object_data_low <= 8'h00;
-            object_addr_low <= 8'h00;
-
             sram_pending <= 1'b0;
             sram_addr_reg <= '0;
             sram_data_reg <= '0;
@@ -164,46 +179,47 @@ module io (
             if (sram_pending && sram.req_ready)
                 sram_pending <= 1'b0;
 
-            if (rx_fire) begin
+            if (rx_pop) begin
                 if (rx_escape) begin
                     // The byte after DLE is payload, even if it is 00, 01, or 03.
                     rx_escape <= 1'b0;
-                end else if (rx_bytes.data == DLE) begin
+                end else if (rx_byte_reg == DLE) begin
                     rx_escape <= 1'b1;
                 end
             end
             //the above code handles the escape character by setting rx_escape to 1 when DLE (03) is recieved, and then the next byte will be treated as payload, even if it is 00, 01, or 03, and then rx_escape will be set back to 0 after that byte is processed
-            if (rx_fire &&
-                (rx_escape || rx_bytes.data != DLE) &&
+            if (rx_pop &&
+                (rx_escape || rx_byte_reg != DLE) &&
                 rx_state != RX_IDLE) begin
 
                 case (rx_state)
                     RX_RENDER: begin
                         case (rx_index)
                             2'd0: begin
-                                dim_low <= rx_bytes.data;
+                                render.img_w[7:0] <= rx_byte_reg;
                                 rx_index <= 2'd1;
                             end
-                            //like goes throug hte first byte of the render message, which is the low byte of the width, and then goes to the next index to get the next byte, which is the high byte of the width
+                            //Write the width's low byte straight into its output register.
 
                             2'd1: begin
-                                render.img_w <= {rx_bytes.data[3:0], dim_low};
+                                render.img_w[DIM_W-1:8] <= rx_byte_reg[DIM_W-9:0];
                                 rx_index <= 2'd2;
                             end
-                            //width
+                            //Complete the width in place; no temporary dim_low register.
 
                             2'd2: begin
-                                dim_low <= rx_bytes.data;
+                                render.img_h[7:0] <= rx_byte_reg;
                                 rx_index <= 2'd3;
                             end
-                            //height
+                            //Write the height's low byte straight into its output register.
 
                             2'd3: begin
-                                render.img_h <= {rx_bytes.data[3:0], dim_low};
+                                render.img_h[DIM_W-1:8] <= rx_byte_reg[DIM_W-9:0];
                                 render.render <= 1'b1;
                                 rx_state <= RX_IDLE;
                                 rx_index <= 2'd0;
                             end
+                            //Complete the height, then strobe render for one cycle.
                             
                             default: begin
                                 rx_state <= RX_IDLE;
@@ -216,33 +232,31 @@ module io (
                     RX_OBJECT: begin
                         case (rx_index)
                             2'd0: begin
-                                object_data_low <= rx_bytes.data;
+                                sram_data_reg[7:0] <= rx_byte_reg;
                                 rx_index <= 2'd1;
                             end
-                            //basically does the same thing with the object message, which is 4 bytes long, and will store the low byte of the data, and then will go to the next index to get the next byte, which is the high byte of the data
+                            //Write the data's low byte directly into the SRAM request register.
 
                             2'd1: begin
-                                object_addr_low <= 8'h00;
-                                // Temporarily keep the high data byte here;
-                                // it is combined with object_data_low at the end.
-                                sram_data_reg[15:8] <= rx_bytes.data;
+                                sram_data_reg[15:8] <= rx_byte_reg;
                                 rx_index <= 2'd2;
                             end
-                            //here, the low byte of the address is set to 0, and the high byte of the data is stored in the sram_data_reg, and then goes to the next index to get the next byte, which is the low byte of the address
+                            //Write the data's high byte directly into the SRAM request register.
 
                             2'd2: begin
-                                object_addr_low <= rx_bytes.data;
+                                sram_addr_reg[7:0] <= rx_byte_reg;
                                 rx_index <= 2'd3;
                             end
+                            //Write the address's low byte directly into the SRAM request register.
 
                             2'd3: begin
-                                sram_addr_reg <= {rx_bytes.data[0], object_addr_low};
-                                sram_data_reg[7:0] <= object_data_low;
+                                sram_addr_reg[ADDR_W-1:8] <= rx_byte_reg[ADDR_W-9:0];
                                 sram_pending <= 1'b1;
                                 rx_state <= RX_IDLE;
                                 rx_index <= 2'd0;
                             end
-                            //here, the high byte of the address is stored in the sram_addr_reg, and the low byte of the data is stored in the sram_data_reg, and then sram_pending is set to 1 to tell the sram interface that there is a request pending, and then goes back to idle state
+                            //The 9-bit address uses only bit 0 of this final byte.
+                            //Now all request fields are assembled, so assert valid.
 
                             default: begin
                                 rx_state <= RX_IDLE;
@@ -258,10 +272,10 @@ module io (
                 endcase
             end
             //essentially this entire big if statement is the main parser logic, which configures the parser to specifically handle the render and object messages, and will store the data in the appropriate registers, and then will set the appropriate signals to tell the RTU or sram interface that there is a request pending, and then will go back to idle state
-            if (rx_fire && !rx_escape && rx_bytes.data != DLE &&
+            if (rx_pop && !rx_escape && rx_byte_reg != DLE &&
                 rx_state == RX_IDLE) begin
                     //saying that if the conditions of a byte being recieved, not being an escape character, and not being a DLE character, and the parser is in idle state, then it will check the first byte of the message to see if it is a render or object message, and then will set the appropriate state and index to start processing the message
-                case (rx_bytes.data)
+                case (rx_byte_reg)
                     RENDER_START: begin
                         rx_state <= RX_RENDER;
                         rx_index <= 2'd0;
