@@ -263,6 +263,78 @@ async def test_invalid_start(dut):
     dut._log.info("invalid start byte test ok, junk ignored, parser recovered")
 
 
+@cocotb.test()
+async def test_b2b(dut):
+    """sending back to back valid messages with no gap, both should land"""
+    dut._log.info("start b2b message test")
+
+    # setup (clock + reset)
+    clock = Clock(dut.clk, 40, units="ns")          # starts clock (25MHz)
+    cocotb.start_soon(clock.start())
+
+    dut.rst_n.value = 0
+    dut.uart_rx.value = 1                           # we're not even using this, so keep idle at 1
+    dut.clkdiv_ctl.value = 0                        # clkdiv not even used, so keep floating at 0
+    dut.clkdiv_data.value = 0
+    dut.dut_io.rx_bytes.valid.value = 0
+    dut.dut_io.rx_bytes.data.value = 0
+    await ClockCycles(dut.clk, 5)                   # hold reset low for 5 cycles
+    dut.rst_n.value = 1                             # release reset
+    await ClockCycles(dut.clk, 2)                   # wait 2 cycles for things to settle, then parser live
+
+    # the monitor that catches both outputs, msg 1 writes to sram, msg 2 pulses render
+    seen = {
+        "sram": False, "addr": None, "data": None,
+        "render": False, "w": None, "h": None,
+    }
+
+    async def watch():
+        while True:                                 # infinite loop that checks both outputs on every clk edge
+            await RisingEdge(dut.clk)
+
+            if int(dut.sram_req_valid.value) == 1 and not seen["sram"]:
+                seen["sram"] = True                 # flag and capture the first sram write from msg 1
+                seen["addr"] = int(dut.sram_req_waddr.value)
+                seen["data"] = int(dut.sram_req_wdata.value)
+
+            if int(dut.render_strobe.value) == 1:  
+                seen["render"] = True               # flag and capture the render pulse from msg 2
+                seen["w"] = int(dut.render_img_w.value)
+                seen["h"] = int(dut.render_img_h.value)
+
+    cocotb.start_soon(watch())
+
+    # 1st msg (object)
+    obj_data = 0xBEEF                               # arbitrary test value (16 bits)
+    obj_addr = 0x111                                # arbitrary test value (9 bits)
+    obj_data_low = obj_data & 0xFF                  # grabs lower 8 bits -> 0xEF
+    obj_data_high = (obj_data >> 8) & 0xFF          # shifts down, masks lower 8 bits -> 0xBE
+    obj_addr_low = obj_addr & 0xFF                  # grabs lower 8 bits -> 0x11
+    obj_addr_high = (obj_addr >> 8) & 0xFF          # shifts down, masks lower 8 bits -> 0x01
+
+    await send_bytes(dut, [0x01, obj_data_low, obj_data_high, obj_addr_low, obj_addr_high])     # inject object msg
+
+    # 2nd msg (render), the b2b part w no gap
+    dim = 0x2A5                                     # arbitrary test value (12 bits)
+    dim_low = dim & 0xFF                            # grabs lower 8 bits -> 0xA5
+    dim_high = (dim >> 8) & 0xFF                    # shift down, masks lower 8 bits -> 0x02
+
+    await send_bytes(dut, [0x00, dim_low, dim_high, dim_low, dim_high])     # inject render msg
+    await ClockCycles(dut.clk, 5)                                           # wait a few cycles for things to settle
+    
+    # check 1st msg landed correctly
+    assert seen["sram"], "first object message produced no write"
+    assert seen["addr"] == obj_addr, f"obj waddr wrong: expected {obj_addr:#05x}, got {seen['addr']:#05x}"
+    assert seen["data"] == obj_data, f"obj wdata wrong: expected {obj_data:#06x}, got {seen['data']:#06x}"
+
+    # check 2nd msg landed correctly, proves parser reset its state after msg 1
+    assert seen["render"], "second render message produced no pulse"
+    assert seen["w"] == dim, f"render w wrong: expected {dim:#05x}, got {seen['w']:#05x}"
+    assert seen["h"] == dim, f"render h wrong: expected {dim:#05x}, got {seen['h']:#05x}"
+
+    dut._log.info("back to back messages test ok, parser recieved both")
+
+
 # async def test(dut):
 #     """confirm cocotb can reach the signals we gonna use"""
 
