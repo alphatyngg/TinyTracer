@@ -194,6 +194,75 @@ async def test_dle(dut):
     dut._log.info(f"DLE escape ok: addr={addr:#05x}, data={data:#06x} delivered through escape, wen={seen['wen']}")
 
 
+@cocotb.test()
+async def test_invalid_start(dut):
+    """invalid start byte test (not 0x00, 0x01, or 0x03), parser should ignore and recovers after"""
+    dut._log.info("start invalid start byte test")
+
+    # setup (clock + reset)
+    clock = Clock(dut.clk, 40, units="ns")          # starts clock (25MHz)
+    cocotb.start_soon(clock.start())
+
+    dut.rst_n.value = 0
+    dut.uart_rx.value = 1                           # we're not even using this, so keep idle at 1
+    dut.clkdiv_ctl.value = 0                        # clkdiv not even used, so keep floating at 0
+    dut.clkdiv_data.value = 0
+    dut.dut_io.rx_bytes.valid.value = 0
+    dut.dut_io.rx_bytes.data.value = 0
+    await ClockCycles(dut.clk, 5)                   # hold reset low for 5 cycles
+    dut.rst_n.value = 1                             # release reset
+    await ClockCycles(dut.clk, 2)                   # wait 2 cycles for things to settle, then parser live
+
+    # the monitor: see if anything fires, and what was written to if it did
+    seen = {"render": False, "sram": False, "addr": None, "data": None}
+
+    async def watch():
+        while True:                                 # infinite loop, checks both outputs on every clk edge
+            await RisingEdge(dut.clk)
+
+            if int(dut.render_strobe.value) == 1:
+                seen["render"] = True               # flags if render ever pulses
+
+            if int(dut.sram_req_valid.value) == 1 and not seen["sram"]:
+                seen["sram"] = True                 # flags + capture the first sram write
+                seen["addr"] = int(dut.sram_req_waddr.value)
+                seen["data"] = int(dut.sram_req_wdata.value)
+
+    cocotb.start_soon(watch())
+
+    # sending in junk bytes (NOT 0x00 0x01 0x03)
+    for junk in (0x42, 0x7F, 0x10):                   # arbitrary meaningless bytes           
+        await send_bytes(dut, [junk])                 # inject junk byte, parser should ignore
+    await ClockCycles(dut.clk, 5)                     # wait a few cycles for things to settle
+
+    # the junk shouldve done nothing, parser idle, no outputs
+    assert int(dut.dut_io.rx_state.value) == 0, f"parser left idle on junk (rx_state={int(dut.dut_io.rx_state.value)})"     # rx_idle == 0
+    assert not seen["render"], "render pulsed on a junk byte"
+    assert not seen["sram"], "sram wrote on a junk byte"
+
+    # the check, a valid object must still parse
+    seen["sram"] = False                                # reset ts so it detects a new write
+    seen["addr"] = None
+    seen["data"] = None
+
+    data = 0x1234                                       # arbitrary test value (16 bits)
+    addr = 0x007                                        # arbitrary test value (9 bits)
+    data_low = data & 0xFF                              # grabs lower 8 bits -> 0x34
+    data_high = (data >> 8) & 0xFF                      # shifts down, masks lower 8 bits -> 0x12
+    addr_low = addr & 0xFF                              # grabs lower 8 bits -> 0x07
+    addr_high = (addr >> 8) & 0xFF                      # shifts down, masks lower 8 bits -> 0x00
+
+    await send_bytes(dut, [0x01, data_low, data_high, addr_low, addr_high])
+    await ClockCycles(dut.clk, 5)
+
+    # valid msg still went thru correctly
+    assert seen["sram"], "valid object after junk failed to produce a write"
+    assert seen["addr"] == addr, f"waddr wrong after junk, expected {addr:#05x}, got {seen['addr']:#05x}"
+    assert seen["data"] == data, f"wdata wrong after junk, expected {data:#06x}, got {seen['data']:#06x}"
+
+    dut._log.info("invalid start byte test ok, junk ignored, parser recovered")
+
+
 # async def test(dut):
 #     """confirm cocotb can reach the signals we gonna use"""
 
